@@ -19,6 +19,7 @@ package types
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/gravitational/trace"
@@ -282,13 +283,21 @@ func (c *GithubConnectorV3) SetDisplay(display string) {
 	c.Spec.Display = display
 }
 
-// GetEndpointURL returns the endpoint URL
+// GetEndpointURL returns the endpoint URL. Falls back to public GitHub when
+// the connector does not set endpoint_url.
 func (c *GithubConnectorV3) GetEndpointURL() string {
+	if u := strings.TrimRight(c.Spec.EndpointURL, "/"); u != "" {
+		return u
+	}
 	return GithubURL
 }
 
-// GetEndpointURL returns the API endpoint URL
+// GetAPIEndpointURL returns the API endpoint URL. Falls back to public GitHub
+// when the connector does not set api_endpoint_url.
 func (c *GithubConnectorV3) GetAPIEndpointURL() string {
+	if u := strings.TrimRight(c.Spec.APIEndpointURL, "/"); u != "" {
+		return u
+	}
 	return GithubAPIURL
 }
 

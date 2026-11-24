@@ -27,6 +27,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -180,6 +181,9 @@ func (a *Server) CreateGithubAuthRequest(ctx context.Context, req types.GithubAu
 
 // upsertGithubConnector creates or updates a Github connector.
 func (a *Server) upsertGithubConnector(ctx context.Context, connector types.GithubConnector) (types.GithubConnector, error) {
+	if err := validateGitlabConnector(connector); err != nil {
+		return nil, trace.Wrap(err)
+	}
 	if err := checkGithubOrgSSOSupport(ctx, connector, nil, a.modules.BuildType(), a.githubOrgSSOCache, nil); err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -206,6 +210,9 @@ func (a *Server) upsertGithubConnector(ctx context.Context, connector types.Gith
 
 // createGithubConnector creates a new Github connector.
 func (a *Server) createGithubConnector(ctx context.Context, connector types.GithubConnector) (types.GithubConnector, error) {
+	if err := validateGitlabConnector(connector); err != nil {
+		return nil, trace.Wrap(err)
+	}
 	if err := checkGithubOrgSSOSupport(ctx, connector, nil, a.modules.BuildType(), a.githubOrgSSOCache, nil); err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -233,6 +240,9 @@ func (a *Server) createGithubConnector(ctx context.Context, connector types.Gith
 
 // updateGithubConnector updates an existing Github connector.
 func (a *Server) updateGithubConnector(ctx context.Context, connector types.GithubConnector) (types.GithubConnector, error) {
+	if err := validateGitlabConnector(connector); err != nil {
+		return nil, trace.Wrap(err)
+	}
 	if err := checkGithubOrgSSOSupport(ctx, connector, nil, a.modules.BuildType(), a.githubOrgSSOCache, nil); err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -270,7 +280,7 @@ type httpRequester interface {
 // in conn and in userTeams will be checked. If client is nil a
 // net/http.Client will be used.
 func checkGithubOrgSSOSupport(ctx context.Context, conn types.GithubConnector, userTeams []GithubTeamResponse, buildType string, orgCache *utils.FnCache, client httpRequester) error {
-	if buildType == modules.BuildEnterprise {
+	if buildType == modules.BuildEnterprise || isGitlabConnector(conn) {
 		return nil
 	}
 
@@ -504,6 +514,9 @@ func (a *Server) getGithubConnector(ctx context.Context, request types.GithubAut
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
+		if err := validateGitlabConnector(connector); err != nil {
+			return nil, trace.Wrap(err)
+		}
 
 		return connector, nil
 	}
@@ -517,11 +530,28 @@ func (a *Server) getGithubConnector(ctx context.Context, request types.GithubAut
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
+	if err := validateGitlabConnector(connector); err != nil {
+		return nil, trace.Wrap(err)
+	}
 
 	return connector, nil
 }
 
 func newGithubOAuth2Config(connector types.GithubConnector) oauth2.Config {
+	if isGitlabConnector(connector) {
+		// The endpoint URL is validated by validateGitlabConnector.
+		base := connector.GetEndpointURL()
+		return oauth2.Config{
+			ClientID:     connector.GetClientID(),
+			ClientSecret: connector.GetClientSecret(),
+			RedirectURL:  connector.GetRedirectURL(),
+			Scopes:       GitlabScopes,
+			Endpoint: oauth2.Endpoint{
+				AuthURL:  fmt.Sprintf("%s/%s", base, gitlabAuthPath),
+				TokenURL: fmt.Sprintf("%s/%s", base, gitlabTokenPath),
+			},
+		}
+	}
 	return oauth2.Config{
 		ClientID:     connector.GetClientID(),
 		ClientSecret: connector.GetClientSecret(),
@@ -802,6 +832,10 @@ func (a *Server) getGithubUserAndTeams(
 		// Allow tests to override the user and teams response instead of
 		// calling out to GitHub.
 		return a.GithubUserAndTeamsOverride()
+	}
+
+	if isGitlabConnector(connector) {
+		return a.getGitlabUserAndTeams(ctx, connector, code, diagCtx, logger)
 	}
 
 	ghClient, err := a.getGitHubAPIClient(ctx, connector, code, diagCtx, logger)

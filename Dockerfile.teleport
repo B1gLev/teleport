@@ -1,0 +1,10 @@
+FROM debian:bookworm-slim
+
+# CA certificates are required so Teleport can reach GitLab over HTTPS
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY teleport tctl tsh /usr/local/bin/
+
+ENTRYPOINT ["/usr/local/bin/teleport"]
+CMD ["start", "-c", "/etc/teleport/teleport.yaml"]

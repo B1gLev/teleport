@@ -1,0 +1,454 @@
+diff --git a/api/types/github.go b/api/types/github.go
+index 8703e60..7f6ee92 100644
+--- a/api/types/github.go
++++ b/api/types/github.go
+@@ -19,6 +19,7 @@ package types
+ import (
+ 	"context"
+ 	"log/slog"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/gravitational/trace"
+@@ -282,13 +283,21 @@ func (c *GithubConnectorV3) SetDisplay(display string) {
+ 	c.Spec.Display = display
+ }
+ 
+-// GetEndpointURL returns the endpoint URL
++// GetEndpointURL returns the endpoint URL. Falls back to public GitHub when
++// the connector does not set endpoint_url.
+ func (c *GithubConnectorV3) GetEndpointURL() string {
++	if u := strings.TrimRight(c.Spec.EndpointURL, "/"); u != "" {
++		return u
++	}
+ 	return GithubURL
+ }
+ 
+-// GetEndpointURL returns the API endpoint URL
++// GetAPIEndpointURL returns the API endpoint URL. Falls back to public GitHub
++// when the connector does not set api_endpoint_url.
+ func (c *GithubConnectorV3) GetAPIEndpointURL() string {
++	if u := strings.TrimRight(c.Spec.APIEndpointURL, "/"); u != "" {
++		return u
++	}
+ 	return GithubAPIURL
+ }
+ 
+diff --git a/lib/auth/github.go b/lib/auth/github.go
+index 4dff33a..29269db 100644
+--- a/lib/auth/github.go
++++ b/lib/auth/github.go
+@@ -27,6 +27,7 @@ import (
+ 	"log/slog"
+ 	"net/http"
+ 	"net/url"
++	"strconv"
+ 	"strings"
+ 	"time"
+ 
+@@ -180,6 +181,9 @@ func (a *Server) CreateGithubAuthRequest(ctx context.Context, req types.GithubAu
+ 
+ // upsertGithubConnector creates or updates a Github connector.
+ func (a *Server) upsertGithubConnector(ctx context.Context, connector types.GithubConnector) (types.GithubConnector, error) {
++	if err := validateGitlabConnector(connector); err != nil {
++		return nil, trace.Wrap(err)
++	}
+ 	if err := checkGithubOrgSSOSupport(ctx, connector, nil, a.modules.BuildType(), a.githubOrgSSOCache, nil); err != nil {
+ 		return nil, trace.Wrap(err)
+ 	}
+@@ -206,6 +210,9 @@ func (a *Server) upsertGithubConnector(ctx context.Context, connector types.Gith
+ 
+ // createGithubConnector creates a new Github connector.
+ func (a *Server) createGithubConnector(ctx context.Context, connector types.GithubConnector) (types.GithubConnector, error) {
++	if err := validateGitlabConnector(connector); err != nil {
++		return nil, trace.Wrap(err)
++	}
+ 	if err := checkGithubOrgSSOSupport(ctx, connector, nil, a.modules.BuildType(), a.githubOrgSSOCache, nil); err != nil {
+ 		return nil, trace.Wrap(err)
+ 	}
+@@ -233,6 +240,9 @@ func (a *Server) createGithubConnector(ctx context.Context, connector types.Gith
+ 
+ // updateGithubConnector updates an existing Github connector.
+ func (a *Server) updateGithubConnector(ctx context.Context, connector types.GithubConnector) (types.GithubConnector, error) {
++	if err := validateGitlabConnector(connector); err != nil {
++		return nil, trace.Wrap(err)
++	}
+ 	if err := checkGithubOrgSSOSupport(ctx, connector, nil, a.modules.BuildType(), a.githubOrgSSOCache, nil); err != nil {
+ 		return nil, trace.Wrap(err)
+ 	}
+@@ -270,7 +280,7 @@ type httpRequester interface {
+ // in conn and in userTeams will be checked. If client is nil a
+ // net/http.Client will be used.
+ func checkGithubOrgSSOSupport(ctx context.Context, conn types.GithubConnector, userTeams []GithubTeamResponse, buildType string, orgCache *utils.FnCache, client httpRequester) error {
+-	if buildType == modules.BuildEnterprise {
++	if buildType == modules.BuildEnterprise || isGitlabConnector(conn) {
+ 		return nil
+ 	}
+ 
+@@ -504,6 +514,9 @@ func (a *Server) getGithubConnector(ctx context.Context, request types.GithubAut
+ 		if err != nil {
+ 			return nil, trace.Wrap(err)
+ 		}
++		if err := validateGitlabConnector(connector); err != nil {
++			return nil, trace.Wrap(err)
++		}
+ 
+ 		return connector, nil
+ 	}
+@@ -517,11 +530,28 @@ func (a *Server) getGithubConnector(ctx context.Context, request types.GithubAut
+ 	if err != nil {
+ 		return nil, trace.Wrap(err)
+ 	}
++	if err := validateGitlabConnector(connector); err != nil {
++		return nil, trace.Wrap(err)
++	}
+ 
+ 	return connector, nil
+ }
+ 
+ func newGithubOAuth2Config(connector types.GithubConnector) oauth2.Config {
++	if isGitlabConnector(connector) {
++		// The endpoint URL is validated by validateGitlabConnector.
++		base := connector.GetEndpointURL()
++		return oauth2.Config{
++			ClientID:     connector.GetClientID(),
++			ClientSecret: connector.GetClientSecret(),
++			RedirectURL:  connector.GetRedirectURL(),
++			Scopes:       GitlabScopes,
++			Endpoint: oauth2.Endpoint{
++				AuthURL:  fmt.Sprintf("%s/%s", base, gitlabAuthPath),
++				TokenURL: fmt.Sprintf("%s/%s", base, gitlabTokenPath),
++			},
++		}
++	}
+ 	return oauth2.Config{
+ 		ClientID:     connector.GetClientID(),
+ 		ClientSecret: connector.GetClientSecret(),
+@@ -804,6 +834,10 @@ func (a *Server) getGithubUserAndTeams(
+ 		return a.GithubUserAndTeamsOverride()
+ 	}
+ 
++	if isGitlabConnector(connector) {
++		return a.getGitlabUserAndTeams(ctx, connector, code, diagCtx, logger)
++	}
++
+ 	ghClient, err := a.getGitHubAPIClient(ctx, connector, code, diagCtx, logger)
+ 	if err != nil {
+ 		return nil, nil, trace.Wrap(err)
+diff --git a/lib/auth/gitlab.go b/lib/auth/gitlab.go
+new file mode 100644
+index 0000000..8078acf
+--- /dev/null
++++ b/lib/auth/gitlab.go
+@@ -0,0 +1,208 @@
++/*
++ * Teleport
++ * Copyright (C) 2023  Gravitational, Inc.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU Affero General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Affero General Public License for more details.
++ *
++ * You should have received a copy of the GNU Affero General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++package auth
++
++import (
++	"context"
++	"encoding/json"
++	"log/slog"
++	"net/http"
++	"net/url"
++	"strconv"
++	"strings"
++
++	"github.com/gravitational/trace"
++
++	"github.com/gravitational/teleport"
++	"github.com/gravitational/teleport/api/types"
++	"github.com/gravitational/teleport/lib/defaults"
++	"github.com/gravitational/teleport/lib/utils"
++)
++
++// GitLab support reuses the "github" auth connector kind. A connector is
++// treated as a GitLab connector when it carries the label provider=gitlab and
++// its endpoint_url points at the GitLab instance, for example:
++//
++//	kind: github
++//	version: v3
++//	metadata:
++//	  name: gitlab
++//	  labels:
++//	    provider: gitlab
++//	spec:
++//	  endpoint_url: https://gitlab.example.com
++//	  ...
++//
++// GitLab groups are mapped onto the GitHub organization/team model: the
++// organization is the top-level group and the team is the full group path
++// (for example "acme/infra" in organization "acme"). Only direct group
++// memberships are reported by GitLab, ancestors are not implied.
++const (
++	gitlabProviderLabel = "provider"
++	gitlabProviderValue = "gitlab"
++
++	gitlabAuthPath     = "oauth/authorize"
++	gitlabTokenPath    = "oauth/token"
++	gitlabUserinfoPath = "oauth/userinfo"
++)
++
++// GitlabScopes is the list of scopes requested during the GitLab OAuth2 flow.
++// "openid" returns the user ID and the groups_direct claim, "profile" adds
++// the username (nickname claim).
++var GitlabScopes = []string{"openid", "profile"}
++
++// isGitlabConnector returns true if the connector is labelled as a GitLab one.
++func isGitlabConnector(c types.GithubConnector) bool {
++	return c.GetMetadata().Labels[gitlabProviderLabel] == gitlabProviderValue
++}
++
++// validateGitlabConnector makes sure a GitLab labelled connector has a usable
++// endpoint URL. It is a no-op for regular GitHub connectors.
++func validateGitlabConnector(c types.GithubConnector) error {
++	if !isGitlabConnector(c) {
++		return nil
++	}
++	base := c.GetEndpointURL()
++	if base == types.GithubURL {
++		return trace.BadParameter("GitLab connector %q requires endpoint_url to be set to the URL of the GitLab instance", c.GetName())
++	}
++	u, err := url.Parse(base)
++	if err != nil || u.Scheme != "https" || u.Host == "" {
++		return trace.BadParameter("GitLab connector %q: endpoint_url must be an absolute https:// URL", c.GetName())
++	}
++	return nil
++}
++
++// gitlabUserinfo is the subset of the GitLab OpenID Connect userinfo response
++// that is used to build Teleport claims.
++type gitlabUserinfo struct {
++	Sub               string   `json:"sub"`
++	Nickname          string   `json:"nickname"`
++	PreferredUsername string   `json:"preferred_username"`
++	GroupsDirect      []string `json:"groups_direct"`
++}
++
++// getGitlabUserAndTeams exchanges the authorization code for a token, queries
++// the GitLab userinfo endpoint and converts the result to the structures the
++// GitHub code path works with.
++func (a *Server) getGitlabUserAndTeams(
++	ctx context.Context,
++	connector types.GithubConnector,
++	code string,
++	diagCtx *SSODiagContext,
++	logger *slog.Logger,
++) (*GithubUserResponse, []GithubTeamResponse, error) {
++	config := newGithubOAuth2Config(connector)
++
++	token, err := config.Exchange(ctx, code)
++	if err != nil {
++		return nil, nil, trace.Wrap(err, "Requesting GitLab OAuth2 token failed.")
++	}
++
++	// GitLab normally echoes the granted scopes, but do not fail if it does not.
++	scope, _ := token.Extra("scope").(string)
++	diagCtx.Info.GithubTokenInfo = &types.GithubTokenInfo{
++		TokenType: token.TokenType,
++		Expires:   token.ExpiresIn,
++		Scope:     scope,
++	}
++	logger.DebugContext(ctx, "Obtained GitLab OAuth2 token",
++		"type", token.TokenType, "expires", token.ExpiresIn, "scope", scope)
++
++	ui, err := fetchGitlabUserinfo(ctx, connector.GetEndpointURL(), token.AccessToken)
++	if err != nil {
++		return nil, nil, trace.Wrap(err, "failed to query GitLab user info")
++	}
++
++	user, teams, err := gitlabUserAndTeams(ui)
++	if err != nil {
++		return nil, nil, trace.Wrap(err)
++	}
++	logger.DebugContext(ctx, "Retrieved groups for GitLab user.",
++		"num_groups", len(teams), "gitlab_user", user.Login)
++	return user, teams, nil
++}
++
++func fetchGitlabUserinfo(ctx context.Context, baseURL, accessToken string) (*gitlabUserinfo, error) {
++	client, err := defaults.HTTPClient()
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++
++	ctx, cancel := context.WithTimeout(ctx, defaults.HTTPRequestTimeout)
++	defer cancel()
++
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
++		strings.TrimRight(baseURL, "/")+"/"+gitlabUserinfoPath, nil)
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++	req.Header.Set("Authorization", "Bearer "+accessToken)
++
++	resp, err := client.Do(req)
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++	defer resp.Body.Close()
++
++	body, err := utils.ReadAtMost(resp.Body, teleport.MaxHTTPResponseSize)
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++	if resp.StatusCode != http.StatusOK {
++		return nil, trace.AccessDenied("bad response from GitLab userinfo endpoint: %v", resp.StatusCode)
++	}
++
++	var ui gitlabUserinfo
++	if err := json.Unmarshal(body, &ui); err != nil {
++		return nil, trace.Wrap(err)
++	}
++	return &ui, nil
++}
++
++// gitlabUserAndTeams converts a GitLab userinfo response to the user and team
++// structures used by populateGithubClaims.
++func gitlabUserAndTeams(ui *gitlabUserinfo) (*GithubUserResponse, []GithubTeamResponse, error) {
++	username := ui.Nickname
++	if username == "" {
++		username = ui.PreferredUsername
++	}
++	if username == "" {
++		return nil, nil, trace.BadParameter("GitLab userinfo has no username, was the profile scope granted?")
++	}
++	id, err := strconv.ParseInt(ui.Sub, 10, 64)
++	if err != nil {
++		return nil, nil, trace.BadParameter("GitLab userinfo has an invalid subject %q", ui.Sub)
++	}
++
++	teams := make([]GithubTeamResponse, 0, len(ui.GroupsDirect))
++	for _, g := range ui.GroupsDirect {
++		g = strings.Trim(g, "/")
++		if g == "" {
++			continue
++		}
++		org, _, _ := strings.Cut(g, "/")
++		teams = append(teams, GithubTeamResponse{
++			Name: g,
++			Slug: g,
++			Org:  GithubOrgResponse{Login: org},
++		})
++	}
++	return &GithubUserResponse{Login: username, ID: id}, teams, nil
++}
+diff --git a/lib/auth/gitlab_test.go b/lib/auth/gitlab_test.go
+new file mode 100644
+index 0000000..8116b0b
+--- /dev/null
++++ b/lib/auth/gitlab_test.go
+@@ -0,0 +1,81 @@
++/*
++ * Teleport
++ * Copyright (C) 2023  Gravitational, Inc.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU Affero General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Affero General Public License for more details.
++ *
++ * You should have received a copy of the GNU Affero General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++package auth
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/require"
++
++	"github.com/gravitational/teleport/api/types"
++)
++
++func TestGitlabUserAndTeams(t *testing.T) {
++	user, teams, err := gitlabUserAndTeams(&gitlabUserinfo{
++		Sub:          "42",
++		Nickname:     "alice",
++		GroupsDirect: []string{"acme", "acme/infra/ops", "/other/", ""},
++	})
++	require.NoError(t, err)
++	require.Equal(t, "alice", user.Login)
++	require.EqualValues(t, 42, user.ID)
++
++	claims, err := populateGithubClaims(user, teams)
++	require.NoError(t, err)
++	require.Equal(t, "alice", claims.Username)
++	require.Equal(t, "42", claims.UserID)
++	require.Equal(t, map[string][]string{
++		"acme":  {"acme", "acme/infra/ops"},
++		"other": {"other"},
++	}, claims.OrganizationToTeams)
++
++	connector, err := types.NewGithubConnector("gitlab", types.GithubConnectorSpecV3{
++		TeamsToRoles: []types.TeamRolesMapping{
++			{Organization: "acme", Team: "acme/infra/ops", Roles: []string{"access"}},
++		},
++	})
++	require.NoError(t, err)
++	roles, _, _ := connector.MapClaims(*claims)
++	require.Equal(t, []string{"access"}, roles)
++}
++
++func TestGitlabUserAndTeamsErrors(t *testing.T) {
++	_, _, err := gitlabUserAndTeams(&gitlabUserinfo{Sub: "1"})
++	require.Error(t, err, "missing username")
++
++	_, _, err = gitlabUserAndTeams(&gitlabUserinfo{Sub: "abc", Nickname: "bob"})
++	require.Error(t, err, "non-numeric subject")
++}
++
++func TestValidateGitlabConnector(t *testing.T) {
++	newConn := func(labels map[string]string, endpoint string) types.GithubConnector {
++		c, err := types.NewGithubConnector("c", types.GithubConnectorSpecV3{EndpointURL: endpoint})
++		require.NoError(t, err)
++		md := c.GetMetadata()
++		md.Labels = labels
++		c.SetMetadata(md)
++		return c
++	}
++	gitlab := map[string]string{"provider": "gitlab"}
++
++	require.NoError(t, validateGitlabConnector(newConn(nil, "")), "plain GitHub connectors are untouched")
++	require.Error(t, validateGitlabConnector(newConn(gitlab, "")), "endpoint_url is required")
++	require.Error(t, validateGitlabConnector(newConn(gitlab, "http://gitlab.example.com")), "https only")
++	require.NoError(t, validateGitlabConnector(newConn(gitlab, "https://gitlab.example.com/")))
++}
+diff --git a/lib/services/github.go b/lib/services/github.go
+index 0444cc5..d2a76a0 100644
+--- a/lib/services/github.go
++++ b/lib/services/github.go
+@@ -181,7 +181,10 @@ func MarshalOSSGithubConnector(githubConnector types.GithubConnector, opts ...Ma
+ 		//
+ 		// Note that the enterprise marshaler also calls this marshaler to
+ 		// produce the final output.
+-		if modules.GetModules().IsOSSBuild() {
++		// Connectors labelled provider=gitlab are handled by the GitLab
++		// code path in lib/auth and need a custom endpoint URL.
++		isGitlab := githubConnector.Metadata.Labels["provider"] == "gitlab"
++		if modules.GetModules().IsOSSBuild() && !isGitlab {
+ 			if githubConnector.Spec.EndpointURL != "" &&
+ 				githubConnector.Spec.EndpointURL != types.GithubURL {
+ 				return nil, fmt.Errorf("GitHub endpoint URL is set: %w", ErrRequiresEnterprise)

@@ -181,7 +181,10 @@ func MarshalOSSGithubConnector(githubConnector types.GithubConnector, opts ...Ma
 		//
 		// Note that the enterprise marshaler also calls this marshaler to
 		// produce the final output.
-		if modules.GetModules().IsOSSBuild() {
+		// Connectors labelled provider=gitlab are handled by the GitLab
+		// code path in lib/auth and need a custom endpoint URL.
+		isGitlab := githubConnector.Metadata.Labels["provider"] == "gitlab"
+		if modules.GetModules().IsOSSBuild() && !isGitlab {
 			if githubConnector.Spec.EndpointURL != "" &&
 				githubConnector.Spec.EndpointURL != types.GithubURL {
 				return nil, fmt.Errorf("GitHub endpoint URL is set: %w", ErrRequiresEnterprise)

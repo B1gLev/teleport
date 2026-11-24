@@ -1,0 +1,49 @@
+name: teleport-image
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Teleport release tag (e.g. v18.1.0)"
+        required: true
+permissions:
+  contents: read
+  packages: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      TELEPORT_VERSION: ${{ inputs.version }}
+    steps:
+      - name: Validate version input
+        run: |
+          [[ "$TELEPORT_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Invalid version: $TELEPORT_VERSION"; exit 1; }
+      - uses: actions/checkout@v4
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
+      - name: Clone Teleport source and apply patch
+        run: |
+          git clone --depth 1 -b "$TELEPORT_VERSION" https://github.com/gravitational/teleport.git
+          cd teleport
+          git apply --check ../patches/gitlab-sso.patch
+          git apply ../patches/gitlab-sso.patch
+      - name: Build binaries
+        run: |
+          make -C teleport/build.assets build-binaries
+          mkdir -p bin && cp teleport/build/teleport teleport/build/tctl teleport/build/tsh bin/
+      - name: Lowercase the owner name for ghcr
+        run: echo "OWNER=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: bin
+          file: Dockerfile.teleport
+          push: true
+          tags: ghcr.io/${{ env.OWNER }}/teleport:${{ inputs.version }}-gitlab${{ github.run_number }}
